@@ -1,0 +1,34 @@
+name: vendor
+on: workflow_dispatch
+jobs:
+  vendor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - run: |
+          mkdir wanime-go && cd wanime-go
+          go mod init wanime
+          cat > deps.go <<'EOF'
+          package main
+
+          import (
+          	_ "github.com/gotd/td/session"
+          	_ "github.com/gotd/td/telegram"
+          	_ "github.com/gotd/td/telegram/auth"
+          	_ "github.com/gotd/td/telegram/downloader"
+          	_ "github.com/gotd/td/telegram/message"
+          	_ "github.com/gotd/td/telegram/uploader"
+          	_ "github.com/gotd/td/tg"
+          	_ "modernc.org/sqlite"
+          )
+
+          func main() {}
+          EOF
+          go mod tidy
+          go mod vendor
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wanime-vendor
+          path: wanime-go
