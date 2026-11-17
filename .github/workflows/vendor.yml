@@ -1,5 +1,7 @@
 name: vendor
 on: workflow_dispatch
+permissions:
+  contents: write
 jobs:
   vendor:
     runs-on: ubuntu-latest
@@ -7,6 +9,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.24'
+          cache: false
       - run: |
           mkdir wanime-go && cd wanime-go
           go mod init wanime
@@ -28,7 +31,7 @@ jobs:
           EOF
           go mod tidy
           go mod vendor
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wanime-vendor
-          path: wanime-go
+          git init -q -b vendor
+          git add -A
+          git -c user.name=bot -c user.email=bot@example.com commit -qm "go vendor"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" vendor
