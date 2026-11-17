@@ -1,0 +1,151 @@
+package downloader
+
+import (
+	"context"
+	"strconv"
+
+	"github.com/go-faster/errors"
+
+	"github.com/gotd/td/tg"
+)
+
+// RedirectError error is returned when Downloader get CDN redirect.
+// See https://core.telegram.org/constructor/upload.fileCdnRedirect.
+type RedirectError struct {
+	Redirect *tg.UploadFileCDNRedirect
+}
+
+// Error implements error interface.
+func (r *RedirectError) Error() string {
+	return "redirect to CDN DC " + strconv.Itoa(r.Redirect.DCID)
+}
+
+// master is a master DC download schema.
+// See https://core.telegram.org/api/files#downloading-files.
+type master struct {
+	client Client
+
+	// precise allows the precise flag for parts that need it, see
+	// needPrecise.
+	precise  bool
+	allowCDN bool
+	// retryHandler observes retried transient downloader errors.
+	retryHandler RetryHandler
+	location     tg.InputFileLocationClass
+	// ref is refreshable location, nil if refresh is not set.
+	ref *locationRef
+}
+
+func (c master) currentLocation() tg.InputFileLocationClass {
+	if c.ref != nil {
+		return c.ref.get()
+	}
+	return c.location
+}
+
+// withRefresh calls f with current location, refreshing it on file reference
+// errors if refresh is set.
+func withRefresh[T any](ctx context.Context, c master, f func(loc tg.InputFileLocationClass) (T, error)) (T, error) {
+	for attempt := 0; ; attempt++ {
+		loc := c.currentLocation()
+		r, err := f(loc)
+		if err == nil || c.ref == nil || !IsFileReferenceError(err) {
+			return r, err
+		}
+		if attempt >= maxRefreshAttempts {
+			observerFrom(ctx).refresh(ctx, refreshLimit, err)
+			return r, err
+		}
+		c.reportRetry(RetryOperationFileReference, attempt+1, err)
+		refreshed, err := c.ref.update(ctx, loc)
+		if err != nil {
+			result := refreshError
+			if errors.Is(err, ErrFileNotFound) {
+				result = refreshNotFound
+			}
+			observerFrom(ctx).refresh(ctx, result, err)
+			var zero T
+			return zero, err
+		}
+		if refreshed {
+			// Workers that waited for a refresh of another one don't count.
+			observerFrom(ctx).refresh(ctx, refreshOK, nil)
+		}
+	}
+}
+
+var _ schema = master{}
+
+func (c master) reportRetry(operation string, attempt int, err error) {
+	if attempt < 1 || err == nil || c.retryHandler == nil {
+		return
+	}
+	c.retryHandler(RetryEvent{
+		Operation: operation,
+		Attempt:   attempt,
+		Err:       err,
+	})
+}
+
+func (c master) Chunk(ctx context.Context, offset int64, limit int) (chunk, error) {
+	r, err := withRefresh(ctx, c, func(loc tg.InputFileLocationClass) (tg.UploadFileClass, error) {
+		req := &tg.UploadGetFileRequest{
+			Offset:   offset,
+			Limit:    limit,
+			Location: loc,
+		}
+		req.SetCDNSupported(c.allowCDN)
+		req.SetPrecise(c.precise && needPrecise(offset, limit))
+		return c.client.UploadGetFile(ctx, req)
+	})
+	if err != nil {
+		return chunk{}, err
+	}
+
+	switch result := r.(type) {
+	case *tg.UploadFile:
+		return chunk{data: result.Bytes, tag: result.Type}, nil
+	case *tg.UploadFileCDNRedirect:
+		return chunk{}, &RedirectError{Redirect: result}
+	default:
+		return chunk{}, errors.Errorf("unexpected type %T", r)
+	}
+}
+
+func (c master) Hashes(ctx context.Context, offset int64) ([]tg.FileHash, error) {
+	return withRefresh(ctx, c, func(loc tg.InputFileLocationClass) ([]tg.FileHash, error) {
+		return c.client.UploadGetFileHashes(ctx, &tg.UploadGetFileHashesRequest{
+			Location: loc,
+			Offset:   offset,
+		})
+	})
+}
+
+const (
+	// partAlign is the alignment of offset and limit of upload.getFile
+	// without the precise flag.
+	partAlign = 4 * 1024
+	// partWindow is the window a part must stay within without the precise
+	// flag.
+	partWindow = 1024 * 1024
+)
+
+// needPrecise reports whether a part needs the precise flag of upload.getFile:
+// without it, offset and limit must be divisible by 4 KiB, 1 MiB must be
+// divisible by limit, and the part must not cross a 1 MiB boundary.
+//
+// Telegram Desktop and TDLib never set precise, as their parts are aligned;
+// gotd's default parts are too, so the flag is only sent for unaligned
+// parts, e.g. a resume from an arbitrary offset.
+//
+// See https://core.telegram.org/api/files#downloading-files.
+func needPrecise(offset int64, limit int) bool {
+	if limit <= 0 {
+		return true
+	}
+	l := int64(limit)
+	return offset%partAlign != 0 ||
+		l%partAlign != 0 ||
+		partWindow%l != 0 ||
+		offset/partWindow != (offset+l-1)/partWindow
+}
